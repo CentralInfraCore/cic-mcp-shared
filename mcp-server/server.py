@@ -259,17 +259,28 @@ def _extract_chunk_text(chunk: dict) -> str:
     return ""
 
 
-def _extract_chunk_file_path(chunk: dict) -> str:
+def _extract_chunk_file_paths(chunk: dict) -> list[str]:
+    """Return all file paths for a chunk (dedup-aware: file_paths list)."""
+    fps = chunk.get("file_paths")
+    if isinstance(fps, list) and fps:
+        return [str(p) for p in fps if p]
     meta = chunk.get("metadata", {})
     if not isinstance(meta, dict):
         meta = {}
-    return str(
+    single = (
         chunk.get("file_path")
         or meta.get("file_path")
         or chunk.get("path")
         or meta.get("path")
         or ""
     )
+    return [str(single)] if single else []
+
+
+def _extract_chunk_file_path(chunk: dict) -> str:
+    """Return the canonical (primary) file path for a chunk."""
+    paths = _extract_chunk_file_paths(chunk)
+    return paths[0] if paths else ""
 
 
 def _extract_chunk_section(chunk: dict) -> str:
@@ -480,7 +491,7 @@ def search_query(query: str, top_k: int = DEFAULT_TOPK, threshold: float = 0.0) 
                 "chunk_id": cid,
                 "score": sc,
                 "matched_tokens": sorted(matched.get(cid, set())),
-                "file_path": chunk.get("file_path") or meta.get("file_path"),
+                "file_paths": _extract_chunk_file_paths(chunk),
                 "line_range": _normalize_line_range(chunk.get("line_range") or meta.get("line_range")),
             })
         return results
@@ -500,7 +511,7 @@ def search_query(query: str, top_k: int = DEFAULT_TOPK, threshold: float = 0.0) 
             "chunk_id": cid,
             "score": float(score),
             "matched_tokens": [],
-            "file_path": chunk.get("file_path") or meta.get("file_path"),
+            "file_paths": _extract_chunk_file_paths(chunk),
             "line_range": _normalize_line_range(chunk.get("line_range") or meta.get("line_range")),
         })
     return results
@@ -562,7 +573,7 @@ def search_code(code_snippet: str, top_k: int = DEFAULT_TOPK) -> list[dict]:
             results.append({
                 "chunk_id": cid,
                 "preview": preview,
-                "file_path": file_path,
+                "file_paths": _extract_chunk_file_paths(chunk),
                 "line_range": line_range
             })
             if len(results) >= limit:
@@ -669,24 +680,21 @@ def resolve_path(file_path: str, mode: str = "prefix", limit: int = 200) -> list
         if not isinstance(meta, dict):
             meta = {}
 
-        # Check path match
-        path_raw = (
-            chunk.get("file_path") or
-            meta.get("file_path") or
-            chunk.get("path") or
-            meta.get("path") or ""
-        )
-        path_str = str(path_raw).lower()
+        # Check against all paths (dedup-aware)
+        all_paths = _extract_chunk_file_paths(chunk)
+        matched_paths = []
+        for path_raw in all_paths:
+            path_str = path_raw.lower()
+            if mode == "exact":
+                hit = (path_str == target)
+            elif mode == "contains":
+                hit = (target in path_str)
+            else:  # prefix (default)
+                hit = path_str.startswith(target)
+            if hit:
+                matched_paths.append(path_raw)
 
-        match = False
-        if mode == "exact":
-            match = (path_str == target)
-        elif mode == "contains":
-            match = (target in path_str)
-        else: # prefix (default)
-            match = path_str.startswith(target)
-
-        if match:
+        if matched_paths:
             raw_lines = (
                 chunk.get("line_range") or
                 meta.get("line_range") or
@@ -697,8 +705,9 @@ def resolve_path(file_path: str, mode: str = "prefix", limit: int = 200) -> list
 
             results.append({
                 "chunk_id": cid,
-                "file_path": path_raw,
-                "line_range": line_range
+                "file_paths": all_paths,
+                "matched_paths": matched_paths,
+                "line_range": line_range,
             })
 
             if len(results) >= max_res:
@@ -974,6 +983,640 @@ def find_nodes(
             if len(out) >= limit:
                 return out
     return out
+
+
+@mcp.tool()
+def impact_analysis(node_id: str, max_depth: int = 3) -> dict:
+    """Analyse the downstream impact of a node: what depends on it, critical paths, used_in coverage.
+
+    Performs BFS from node_id through the adjacency graph, collects all reachable downstream
+    nodes, aggregates used_in fields, and identifies critical path nodes (highest fan-out).
+
+    Args:
+        node_id: The node to start from.
+        max_depth: BFS depth limit (default 3, max 5).
+    """
+    kb = load_kb()
+    nodes = kb["nodes"]
+    adj = kb["adj"]
+
+    max_depth = max(1, min(int(max_depth), 5))
+    start = str(node_id)
+
+    if start not in nodes:
+        return {"error": f"node '{node_id}' not found"}
+
+    # BFS
+    visited: dict[str, int] = {start: 0}   # node_id -> depth
+    queue: list[tuple[str, int]] = [(start, 0)]
+    fan_out: dict[str, int] = {}             # node_id -> number of direct children found
+
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        edges = adj.get(current, [])
+        fan_out[current] = len(edges)
+        for edge in edges:
+            target = str(edge.get("target") or edge.get("to") or edge.get("dest") or edge.get("dst") or "")
+            if not target or target in visited:
+                continue
+            visited[target] = depth + 1
+            queue.append((target, depth + 1))
+
+    # Collect used_in from all visited nodes
+    used_in_agg: dict[str, list[str]] = {}
+    downstream: list[dict] = []
+    for nid, depth in visited.items():
+        if nid == start:
+            continue
+        node = nodes.get(nid)
+        if not isinstance(node, dict):
+            continue
+        entry = {
+            "node_id": nid,
+            "label": node.get("label", nid),
+            "type": node.get("type", ""),
+            "depth": depth,
+            "chunk_id": node.get("chunk_id", ""),
+        }
+        downstream.append(entry)
+        for ui in node.get("used_in") or []:
+            used_in_agg.setdefault(str(ui), []).append(nid)
+
+    # Critical path: nodes with highest fan-out (excluding start)
+    critical = sorted(
+        [{"node_id": nid, "fan_out": fo, "label": nodes.get(nid, {}).get("label", nid)}
+         for nid, fo in fan_out.items() if nid != start and fo > 0],
+        key=lambda x: x["fan_out"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "node_id": start,
+        "label": nodes.get(start, {}).get("label", start),
+        "total_downstream": len(downstream),
+        "max_depth_reached": max(visited.values()) if visited else 0,
+        "downstream": downstream,
+        "used_in_coverage": {k: v for k, v in sorted(used_in_agg.items(), key=lambda x: -len(x[1]))},
+        "critical_paths": critical,
+    }
+
+
+@mcp.tool()
+def guided_path(topic: str, max_steps: int = 10) -> dict:
+    """Build an ordered learning path for a topic through the knowledge graph.
+
+    Selects entrypoint nodes matching the topic, then traverses the graph in
+    category priority order (concept → architecture → flow → implementation)
+    to return a structured reading sequence.
+
+    Args:
+        topic: The topic or concept to learn about.
+        max_steps: Maximum nodes in the path (default 10, max 20).
+    """
+    kb = load_kb()
+    nodes = kb["nodes"]
+    adj = kb["adj"]
+    chunk_to_nodes = kb.get("chunk_to_nodes", {})
+
+    max_steps = max(1, min(int(max_steps), 20))
+
+    CATEGORY_PRIORITY = ["concept", "architecture", "flow", "implementation", "spec", "config", "test"]
+
+    def _cat_rank(node: dict) -> int:
+        cats = node.get("category") or []
+        if isinstance(cats, str):
+            cats = [cats]
+        for i, c in enumerate(CATEGORY_PRIORITY):
+            if any(c in str(cat).lower() for cat in cats):
+                return i
+        return len(CATEGORY_PRIORITY)
+
+    # 1) Find candidates via search
+    hits = search_query(topic, top_k=20)
+    candidate_node_ids: list[str] = []
+    seen_chunks: set[str] = set()
+    for h in hits:
+        cid = str(h.get("chunk_id", ""))
+        if not cid or cid in seen_chunks:
+            continue
+        seen_chunks.add(cid)
+        for nid in chunk_to_nodes.get(cid, []):
+            if nid not in candidate_node_ids:
+                candidate_node_ids.append(nid)
+
+    if not candidate_node_ids:
+        return {"topic": topic, "path": [], "note": "no nodes found for topic"}
+
+    # 2) Prefer entrypoints as starting nodes
+    entrypoints = [nid for nid in candidate_node_ids if nodes.get(nid, {}).get("entrypoint")]
+    start_pool = entrypoints if entrypoints else candidate_node_ids[:5]
+
+    # Sort start_pool by category priority
+    start_pool = sorted(start_pool, key=lambda nid: _cat_rank(nodes.get(nid, {})))
+    start = start_pool[0]
+
+    # 3) BFS guided by category priority
+    path: list[dict] = []
+    visited: set[str] = set()
+    queue: list[tuple[str, str]] = [(start, "entrypoint — best match for topic")]
+
+    while queue and len(path) < max_steps:
+        current, reason = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = nodes.get(current)
+        if not isinstance(node, dict):
+            continue
+
+        path.append({
+            "node_id": current,
+            "label": node.get("label", current),
+            "type": node.get("type", ""),
+            "category": node.get("category", []),
+            "chunk_id": node.get("chunk_id", ""),
+            "entrypoint": bool(node.get("entrypoint")),
+            "reason": reason,
+        })
+
+        # Expand neighbours, prioritise by category rank
+        edges = adj.get(current, [])
+        children: list[tuple[str, str]] = []
+        for edge in edges:
+            target = str(edge.get("target") or edge.get("to") or edge.get("dest") or edge.get("dst") or "")
+            if not target or target in visited:
+                continue
+            edge_type = str(edge.get("type") or edge.get("edge_type") or "related")
+            children.append((target, f"via {edge_type} from {node.get('label', current)}"))
+
+        # Sort children by category priority
+        children.sort(key=lambda x: _cat_rank(nodes.get(x[0], {})))
+        queue = children + queue   # depth-first within priority
+
+    return {
+        "topic": topic,
+        "start_node": start,
+        "entrypoints_found": len(entrypoints),
+        "path": path,
+    }
+
+
+SOURCE_DIR = Path(os.environ.get("SOURCE_DIR", str(BASE_DIR / "source")))
+
+
+@mcp.tool()
+def missing_companions(
+    source_dir: str = "",
+    include_empty_semantic: bool = True,
+    limit: int = 50,
+) -> dict:
+    """List Go source files that lack a companion YAML or have empty semantic fields.
+
+    Scans the source directory for .go files and reports:
+    - 'missing': .go files with no companion .yaml at all
+    - 'incomplete': companion YAMLs exist but category/used_in/related_nodes are all empty
+
+    Results are sorted by file size descending (larger = higher priority).
+
+    Args:
+        source_dir: Override the scan root (default: SOURCE_DIR env or source/).
+        include_empty_semantic: Also report companions with no semantic fields filled.
+        limit: Max entries per category (default 50).
+    """
+    import yaml as _yaml
+
+    scan_root = Path(source_dir) if source_dir else SOURCE_DIR
+    if not scan_root.exists():
+        return {"error": f"source_dir not found: {scan_root}"}
+
+    missing: list[dict] = []
+    incomplete: list[dict] = []
+
+    for go_file in sorted(scan_root.rglob("*.go")):
+        if "_test.go" in go_file.name:
+            continue
+        companion = go_file.with_suffix(".yaml")
+        rel = str(go_file.relative_to(scan_root))
+        size = go_file.stat().st_size
+
+        if not companion.exists():
+            missing.append({"file": rel, "size": size})
+            continue
+
+        if not include_empty_semantic:
+            continue
+
+        try:
+            with companion.open() as f:
+                data = _yaml.safe_load(f) or {}
+        except Exception:
+            continue
+
+        cat = data.get("category") or []
+        used = data.get("used_in") or []
+        related = data.get("related_nodes") or []
+        desc = (data.get("description") or "").strip()
+
+        if not cat and not used and not related and not desc:
+            incomplete.append({"file": rel, "companion": str(companion.relative_to(scan_root)), "size": size})
+
+    missing.sort(key=lambda x: -x["size"])
+    incomplete.sort(key=lambda x: -x["size"])
+
+    return {
+        "scan_root": str(scan_root),
+        "missing_count": len(missing),
+        "incomplete_count": len(incomplete),
+        "missing": missing[:limit],
+        "incomplete": incomplete[:limit],
+    }
+
+
+# PROMPTMAP_PATHS: colon-separated list of absolute paths to PROMPTMAP.yaml files.
+# If not set, the tools scan SOURCE_DIR recursively.
+_PROMPTMAP_PATHS_ENV = os.environ.get("PROMPTMAP_PATHS", "")
+
+
+def _find_promptmaps() -> list[Path]:
+    """Return all known PROMPTMAP.yaml paths (env override or source dir scan)."""
+    if _PROMPTMAP_PATHS_ENV:
+        return [Path(p) for p in _PROMPTMAP_PATHS_ENV.split(":") if p.strip()]
+    return list(SOURCE_DIR.rglob("PROMPTMAP.yaml"))
+
+
+def _load_promptmap(path: Path) -> dict:
+    import yaml as _yaml
+    with path.open() as f:
+        return _yaml.safe_load(f) or {}
+
+
+def _save_promptmap(path: Path, data: dict) -> None:
+    import yaml as _yaml
+    with path.open("w") as f:
+        _yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def _promptmap_repo_name(path: Path) -> str:
+    """Derive a short repo name from PROMPTMAP path (parent directory names)."""
+    parts = path.parts
+    try:
+        ai_idx = list(parts).index("ai")
+        return parts[ai_idx - 1] if ai_idx > 0 else path.parent.parent.name
+    except ValueError:
+        return path.parent.parent.name
+
+
+def _iter_tasks(data: dict, sprint: Optional[int] = None):
+    """Yield (sprint_num, task_dict) pairs from a PROMPTMAP data structure."""
+    version = data.get("version", 1)
+    if version >= 2:
+        # v2: top-level entries list + sprint blocks
+        for entry in data.get("entries", []):
+            yield None, entry
+        for block in data.get("sprints", []):
+            snum = block.get("sprint")
+            for task in block.get("tasks", []):
+                if sprint is None or snum == sprint:
+                    yield snum, task
+        # v2 can also have top-level sprint + tasks (single sprint file)
+        if "sprint" in data and "tasks" in data:
+            snum = data["sprint"]
+            for task in data["tasks"]:
+                if sprint is None or snum == sprint:
+                    yield snum, task
+    else:
+        for task in data.get("tasks", []):
+            yield None, task
+
+
+@mcp.tool()
+def list_tasks(
+    repo: str = "",
+    sprint: Optional[int] = None,
+    status: Optional[str] = None,
+) -> list[dict]:
+    """List tasks from PROMPTMAP.yaml files.
+
+    Args:
+        repo: Filter by repo name substring (e.g. 'CIC-Relay'). Empty = all repos.
+        sprint: Filter by sprint number. None = all sprints.
+        status: Filter by status ('todo', 'done', 'in_progress', 'failed'). None = all.
+
+    Returns list of dicts with keys: repo, sprint, task, status, priority, prompt (truncated).
+    """
+    results = []
+    for pm_path in _find_promptmaps():
+        repo_name = _promptmap_repo_name(pm_path)
+        if repo and repo.lower() not in repo_name.lower():
+            continue
+        try:
+            data = _load_promptmap(pm_path)
+        except Exception as e:
+            results.append({"repo": repo_name, "error": str(e)})
+            continue
+        for snum, task in _iter_tasks(data, sprint):
+            if not isinstance(task, dict):
+                continue
+            task_status = task.get("status", "")
+            if status and task_status != status:
+                continue
+            prompt_text = str(task.get("prompt", ""))
+            results.append({
+                "repo": repo_name,
+                "sprint": snum,
+                "task": task.get("task", ""),
+                "status": task_status,
+                "priority": task.get("priority"),
+                "milestone": task.get("milestone"),
+                "prompt": prompt_text[:200] + "..." if len(prompt_text) > 200 else prompt_text,
+                "accept": task.get("accept", ""),
+                "tests": task.get("tests", []),
+            })
+    results.sort(key=lambda x: (x.get("priority") is None, x.get("priority") or 0))
+    return results
+
+
+@mcp.tool()
+def get_next_task(repo: str = "", sprint: Optional[int] = None) -> Optional[dict]:
+    """Return the highest-priority todo task from PROMPTMAP files.
+
+    Args:
+        repo: Filter by repo name substring.
+        sprint: Filter by sprint number. None = any sprint.
+
+    Returns the full task dict (with prompt, tests, accept) or None if no todo tasks found.
+    """
+    tasks = list_tasks(repo=repo, sprint=sprint, status="todo")
+    if not tasks:
+        return None
+    # Already sorted by priority
+    t = tasks[0]
+    # Re-read full prompt (list_tasks truncates it)
+    for pm_path in _find_promptmaps():
+        repo_name = _promptmap_repo_name(pm_path)
+        if t["repo"] != repo_name:
+            continue
+        try:
+            data = _load_promptmap(pm_path)
+        except Exception:
+            continue
+        for snum, task in _iter_tasks(data):
+            if task.get("task") == t["task"] and task.get("status") == "todo":
+                return {
+                    "repo": repo_name,
+                    "sprint": snum,
+                    **{k: v for k, v in task.items()},
+                }
+    return t
+
+
+def _update_task_status(pm_path: Path, task_id: str, new_status: str, extra: Optional[dict] = None) -> bool:
+    """Mutate a task's status in a PROMPTMAP file. Returns True if found and saved."""
+    import yaml as _yaml
+    data = _load_promptmap(pm_path)
+    found = False
+
+    def _patch(task: dict) -> None:
+        nonlocal found
+        if task.get("task") == task_id:
+            task["status"] = new_status
+            if extra:
+                task.update(extra)
+            found = True
+
+    for entry in data.get("entries", []):
+        if isinstance(entry, dict):
+            _patch(entry)
+    for block in data.get("sprints", []):
+        for task in block.get("tasks", []):
+            if isinstance(task, dict):
+                _patch(task)
+    if "tasks" in data:
+        for task in data["tasks"]:
+            if isinstance(task, dict):
+                _patch(task)
+
+    if found:
+        _save_promptmap(pm_path, data)
+    return found
+
+
+@mcp.tool()
+def claim_task(task_id: str, repo: str = "") -> dict:
+    """Mark a task as in_progress in the PROMPTMAP.
+
+    Args:
+        task_id: The task identifier string (e.g. 'upstream-source-http').
+        repo: Repo name substring to narrow the search (optional).
+
+    Returns: {success, repo, task_id, message}
+    """
+    for pm_path in _find_promptmaps():
+        repo_name = _promptmap_repo_name(pm_path)
+        if repo and repo.lower() not in repo_name.lower():
+            continue
+        if _update_task_status(pm_path, task_id, "in_progress"):
+            return {"success": True, "repo": repo_name, "task_id": task_id, "message": "status → in_progress"}
+    return {"success": False, "task_id": task_id, "message": "task not found"}
+
+
+@mcp.tool()
+def complete_task(task_id: str, repo: str = "", result_note: str = "") -> dict:
+    """Mark a task as done in the PROMPTMAP.
+
+    Args:
+        task_id: The task identifier string.
+        repo: Repo name substring to narrow the search (optional).
+        result_note: Short summary of what was done (stored as 'result' field).
+
+    Returns: {success, repo, task_id, message}
+    """
+    extra = {"result": result_note} if result_note else None
+    for pm_path in _find_promptmaps():
+        repo_name = _promptmap_repo_name(pm_path)
+        if repo and repo.lower() not in repo_name.lower():
+            continue
+        if _update_task_status(pm_path, task_id, "done", extra):
+            return {"success": True, "repo": repo_name, "task_id": task_id, "message": "status → done"}
+    return {"success": False, "task_id": task_id, "message": "task not found"}
+
+
+@mcp.tool()
+def fail_task(task_id: str, reason: str, repo: str = "") -> dict:
+    """Mark a task as failed in the PROMPTMAP with a reason.
+
+    Args:
+        task_id: The task identifier string.
+        reason: Why it failed (stored as 'failure_reason' field).
+        repo: Repo name substring to narrow the search (optional).
+
+    Returns: {success, repo, task_id, message}
+    """
+    for pm_path in _find_promptmaps():
+        repo_name = _promptmap_repo_name(pm_path)
+        if repo and repo.lower() not in repo_name.lower():
+            continue
+        if _update_task_status(pm_path, task_id, "failed", {"failure_reason": reason}):
+            return {"success": True, "repo": repo_name, "task_id": task_id, "message": "status → failed"}
+    return {"success": False, "task_id": task_id, "message": "task not found"}
+
+
+@mcp.tool()
+def update_companion(
+    file_path: str,
+    description: str = "",
+    category: Optional[list] = None,
+    used_in: Optional[list] = None,
+    related_nodes: Optional[list] = None,
+    tags: Optional[list] = None,
+) -> dict:
+    """Update semantic fields in a companion YAML file (Go meta companion).
+
+    Only updates fields that are explicitly provided (non-empty/non-None).
+    Auto-generated fields (package, objects, references) are never touched.
+    After updating, the file must be committed (Vault Transit hook signs it automatically).
+
+    Args:
+        file_path: Absolute path or path relative to SOURCE_DIR to the companion .yaml.
+        description: Package-level description (replaces empty description only if provided).
+        category: List of category tags (replaces existing list if provided).
+        used_in: List of usage contexts (replaces existing list if provided).
+        related_nodes: List of related node IDs (replaces existing list if provided).
+        tags: List of keyword tags (replaces existing list if provided).
+
+    Returns: {success, path, updated_fields, message}
+    """
+    import yaml as _yaml
+
+    p = Path(file_path)
+    if not p.is_absolute():
+        p = SOURCE_DIR / file_path
+    if not p.exists():
+        return {"success": False, "path": str(p), "message": "file not found"}
+
+    try:
+        with p.open() as f:
+            data = _yaml.safe_load(f) or {}
+    except Exception as e:
+        return {"success": False, "path": str(p), "message": f"parse error: {e}"}
+
+    updated: list[str] = []
+
+    if description:
+        data["description"] = description
+        updated.append("description")
+    if category is not None:
+        data["category"] = category
+        updated.append("category")
+    if used_in is not None:
+        data["used_in"] = used_in
+        updated.append("used_in")
+    if related_nodes is not None:
+        data["related_nodes"] = related_nodes
+        updated.append("related_nodes")
+    if tags is not None:
+        data["tags"] = tags
+        updated.append("tags")
+
+    if not updated:
+        return {"success": False, "path": str(p), "message": "no fields to update provided"}
+
+    try:
+        with p.open("w") as f:
+            _yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        return {"success": False, "path": str(p), "message": f"write error: {e}"}
+
+    return {
+        "success": True,
+        "path": str(p),
+        "updated_fields": updated,
+        "message": f"Updated {len(updated)} field(s). Commit to trigger Vault Transit signing.",
+    }
+
+
+@mcp.tool()
+def record_decision(
+    node_id: str,
+    decision: str,
+    rationale: str = "",
+    companion_path: str = "",
+) -> dict:
+    """Record an agent decision as a note in a companion YAML or standalone decision file.
+
+    Appends a decision entry to the companion YAML's 'agent_decisions' list.
+    If no companion_path given, tries to find the companion by node_id lookup.
+
+    Args:
+        node_id: KB node ID this decision relates to.
+        decision: Short statement of the decision made.
+        rationale: Why this decision was made (optional).
+        companion_path: Explicit path to companion YAML. If empty, resolved from node_id.
+
+    Returns: {success, path, message}
+    """
+    import yaml as _yaml
+    from datetime import datetime, timezone
+
+    kb = load_kb()
+
+    # Resolve companion path from node if not given
+    p: Optional[Path] = None
+    if companion_path:
+        p = Path(companion_path)
+        if not p.is_absolute():
+            p = SOURCE_DIR / companion_path
+    else:
+        node = kb["nodes"].get(str(node_id))
+        if node:
+            src = node.get("source_file") or node.get("file_path") or ""
+            if src:
+                candidate = Path(src).with_suffix(".yaml")
+                if candidate.exists():
+                    p = candidate
+                else:
+                    candidate2 = SOURCE_DIR / src
+                    candidate2 = candidate2.with_suffix(".yaml")
+                    if candidate2.exists():
+                        p = candidate2
+
+    if p is None or not p.exists():
+        return {
+            "success": False,
+            "node_id": node_id,
+            "message": "companion file not found — provide companion_path explicitly",
+        }
+
+    try:
+        with p.open() as f:
+            data = _yaml.safe_load(f) or {}
+    except Exception as e:
+        return {"success": False, "path": str(p), "message": f"parse error: {e}"}
+
+    decisions = data.setdefault("agent_decisions", [])
+    entry: dict = {
+        "node_id": node_id,
+        "decision": decision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if rationale:
+        entry["rationale"] = rationale
+    decisions.append(entry)
+
+    try:
+        with p.open("w") as f:
+            _yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        return {"success": False, "path": str(p), "message": f"write error: {e}"}
+
+    return {
+        "success": True,
+        "path": str(p),
+        "message": f"Decision recorded in agent_decisions[{len(decisions)-1}]. Commit to persist.",
+    }
 
 
 DEFAULT_HOST = os.environ.get("MCP_HOST", "127.0.0.1")

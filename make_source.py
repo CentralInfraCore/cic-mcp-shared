@@ -6,6 +6,7 @@ import datetime
 import pickle
 import sqlite3
 import re
+import hashlib
 import numpy as np
 from bs4 import BeautifulSoup
 from langdetect import detect, LangDetectException
@@ -14,6 +15,14 @@ from rank_bm25 import BM25Okapi
 import faiss
 
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+
+def tokenize(text):
+    text = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', text)
+    text = re.sub(r'([a-z\d])([A-Z])', r'\1 \2', text)
+    tokens = text.lower().split()
+    stripped = [t.strip('.,;:()[]{}"\'/\\') for t in tokens]
+    return [t for t in stripped if t]
+
 
 def detect_language(text):
     try:
@@ -115,17 +124,27 @@ def process_go_yaml(file_path):
     package = data.get('package', '') or os.path.basename(file_path)
     objects = data.get('objects', [])
 
-    if not objects:
-        text = f"package {package}"
-        if meta['description']:
-            text += f"\n{meta['description']}"
-        return [{
-            'text': text, 'file_path': file_path,
-            'section': package, 'start_line': 1, 'end_line': 1,
-            'lang': 'go', 'type': 'go_package', **meta,
-        }]
+    # Package-level chunk: always emitted, aggregates file path + all object names/descriptions
+    go_file = os.path.splitext(file_path)[0] + '.go'
+    pkg_lines = [f"package {package}", f"file: {os.path.basename(file_path)}", f"source: {os.path.basename(go_file)}"]
+    if meta['description']:
+        pkg_lines.append(meta['description'])
+    if objects:
+        pkg_lines.append("contains: " + ", ".join(o.get('name', '') for o in objects))
+        for obj in objects:
+            name = obj.get('name', '')
+            desc = str(obj.get('description', '')).strip()
+            if desc:
+                pkg_lines.append(f"{name}: {desc}")
+    chunks = [{
+        'text': '\n'.join(pkg_lines), 'file_path': file_path,
+        'section': package, 'start_line': 1, 'end_line': 1,
+        'lang': 'go', 'type': 'go_package', **meta,
+    }]
 
-    chunks = []
+    if not objects:
+        return chunks
+
     for i, obj in enumerate(objects):
         name     = obj.get('name', '')
         kind     = obj.get('kind', '')
@@ -197,14 +216,14 @@ def build_faiss_index(embeddings):
 
 def build_bm25_index(chunks):
     """Build BM25 index for lexical search."""
-    tokenized = [chunk['text'].lower().split() or [""] for chunk in chunks]
+    tokenized = [tokenize(chunk['text']) or [""] for chunk in chunks]
     return BM25Okapi(tokenized)
 
 def create_bm25_inverted_index(chunks, bm25):
     """Lightweight inverted index from BM25 scores (for SQLite compat)."""
     inverted_index = {}
     for i, chunk in enumerate(chunks):
-        tokens = set(chunk['text'].lower().split())
+        tokens = set(tokenize(chunk['text']))
         for word in tokens:
             score = float(bm25.get_scores([word])[i])
             if score > 0.01:
@@ -261,11 +280,12 @@ def create_knowledge_graph_with_content(chunks, embeddings):
     """Build knowledge graph using embedding cosine similarity + YAML related_nodes."""
     nodes, edges = [], []
 
-    # Build path -> [chunk_idx] index for related_nodes resolution
+    # Build path -> [chunk_id] index for related_nodes resolution
+    # Uses all file_paths (dedup-aware) so relative refs resolve from any repo copy
     path_to_chunk_ids = {}
     for chunk in chunks:
-        fp = chunk.get('file_path', '')
-        path_to_chunk_ids.setdefault(fp, []).append(chunk['id'])
+        for fp in chunk.get('file_paths', [chunk.get('file_path', '')]):
+            path_to_chunk_ids.setdefault(fp, []).append(chunk['id'])
 
     # Build chunk_id -> node_id index
     chunk_id_to_node_id = {}
@@ -312,6 +332,48 @@ def create_knowledge_graph_with_content(chunks, embeddings):
     for i, edge in enumerate(edges):
         edge['id'] = f'e{i+1}'
     return nodes, edges
+
+def _content_hash(text: str) -> str:
+    """Return SHA256 hex digest of normalized text content."""
+    return hashlib.sha256(text.strip().encode('utf-8')).hexdigest()
+
+
+def _dedup_chunks(chunks_list: list) -> list:
+    """Deduplicate chunks with identical content.
+
+    Chunks with the same text are merged into a single chunk:
+    - file_path  : canonical (first seen) path — kept for backward compat
+    - file_paths : list of ALL paths where this content appears
+    - tags / category / used_in / related_nodes : union of all occurrences
+    """
+    seen: dict[str, dict] = {}   # content_hash -> merged chunk
+    order: list[str] = []        # preserve first-seen order
+
+    for chunk in chunks_list:
+        h = _content_hash(chunk['text'])
+        if h not in seen:
+            merged = chunk.copy()
+            merged['file_paths'] = [chunk['file_path']]
+            seen[h] = merged
+            order.append(h)
+        else:
+            m = seen[h]
+            fp = chunk['file_path']
+            if fp not in m['file_paths']:
+                m['file_paths'].append(fp)
+            # union metadata fields
+            for field in ('tags', 'category', 'used_in', 'related_nodes'):
+                existing = set(m.get(field, []))
+                for v in chunk.get(field, []):
+                    existing.add(v)
+                m[field] = list(existing)
+
+    deduped = [seen[h] for h in order]
+    removed = len(chunks_list) - len(deduped)
+    if removed:
+        print(f"  [dedup] removed {removed} duplicate chunks ({len(deduped)} unique)")
+    return deduped
+
 
 def _is_go_meta_yaml(file_path):
     """Return True if the YAML file is a Go meta companion (has 'package' + 'objects').
@@ -364,6 +426,7 @@ def process_directory(directory_path):
 
 def build_knowledge_base(source_directory, model_name=EMBEDDING_MODEL):
     chunks_list = process_directory(source_directory)
+    chunks_list = _dedup_chunks(chunks_list)
     chunks_list.sort(key=lambda x: (x['file_path'], x['start_line']))
     for i, chunk in enumerate(chunks_list):
         chunk['id'] = f'c{i+1}'
@@ -391,7 +454,8 @@ def build_knowledge_base(source_directory, model_name=EMBEDDING_MODEL):
         if 'evidence_chunk_id' in edge:
             chunk = next((c for c in chunks_list if c['id'] == edge['evidence_chunk_id']), None)
             if chunk:
-                edge['evidence'] = [{'file': chunk['file_path'], 'start_line': chunk['start_line'], 'end_line': chunk['end_line']}]
+                edge['evidence'] = [{'file': fp, 'start_line': chunk['start_line'], 'end_line': chunk['end_line']}
+                                     for fp in chunk.get('file_paths', [chunk['file_path']])]
 
     return {
         "chunks": {item['id']: item for item in chunks_list},
@@ -469,14 +533,31 @@ def save_kb_to_sqlite(kb_data, output_dir="sqlite_data"):
         pk_str = f', PRIMARY KEY({", ".join(pk)})' if pk else ''
         cursor.execute(f"CREATE TABLE {table['name']} ({cols}{pk_str})")
 
-    files_map = {path: i + 1 for i, path in enumerate(sorted(list(set(c['file_path'] for c in kb_data['chunks'].values()))))}
+    # Collect all unique file paths (dedup-aware: file_paths list)
+    all_paths = sorted(set(
+        fp
+        for c in kb_data['chunks'].values()
+        for fp in c.get('file_paths', [c.get('file_path', '')])
+        if fp
+    ))
+    files_map = {path: i + 1 for i, path in enumerate(all_paths)}
     cursor.executemany("INSERT INTO files (id, path) VALUES (?, ?)", [(i, p) for p, i in files_map.items()])
 
     terms_map = {term: i + 1 for i, term in enumerate(sorted(kb_data['inverted_index'].keys()))}
     cursor.executemany("INSERT INTO terms (id, term) VALUES (?, ?)", [(i, t) for t, i in terms_map.items()])
 
-    chunk_data = [(c['id'], files_map[c['file_path']], c['text'], c['section'], c['start_line'], c['end_line'], c['lang'], c['type']) for c in kb_data['chunks'].values()]
-    cursor.executemany("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", chunk_data)
+    # chunks table no longer has file_id (moved to chunk_paths junction table)
+    chunk_data = [(c['id'], c['text'], c['section'], c['start_line'], c['end_line'], c['lang'], c['type']) for c in kb_data['chunks'].values()]
+    cursor.executemany("INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?)", chunk_data)
+
+    # chunk_paths: one row per (chunk_id, file_id) pair
+    chunk_paths_data = [
+        (c['id'], files_map[fp])
+        for c in kb_data['chunks'].values()
+        for fp in c.get('file_paths', [c.get('file_path', '')])
+        if fp and fp in files_map
+    ]
+    cursor.executemany("INSERT INTO chunk_paths (chunk_id, file_id) VALUES (?, ?)", chunk_paths_data)
 
     cursor.executemany("INSERT INTO nodes VALUES (?, ?, ?, ?)", [(n['id'], n['chunk_id'], n['type'], n['label']) for n in kb_data['nodes'].values()])
 

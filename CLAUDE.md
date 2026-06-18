@@ -79,6 +79,98 @@ A release tooling (validate, test, fmt) Docker containerben fut.
 | `kb_status` | KB állapot és fájl info |
 | `reload_kb` | KB újratöltés lemezről |
 
+## AI Reasoning Protocol
+
+### Boot fázis (kötelező session-indításkor)
+
+Mielőtt szakmai kérdésre válaszolsz, futtasd le ezt a szekvenciát:
+
+1. `kb_status` — KB artifact állapot ellenőrzése
+2. Keress rá az `axioms` és `symbols` node-okra (`search_nodes`)
+3. Keress rá a `limits` és `contract` fogalmakra
+4. Határozd meg a runtime státuszt: **production / scaffold / concept**
+
+A boot végén internalizáld:
+- Mit tekintesz invariánsnak
+- Melyek a kulcsfogalmak
+- Mi runtime, mi scaffold, mi csak koncepció
+
+**Amíg ez nem teljesült, ne válaszolj szakmai kérdésre.**
+
+### Graph-first reasoning (ne search→snippet→answer)
+
+Query helyett subgraph-építés:
+
+1. Azonosítsd a fogalmat
+2. Keresd meg az induló node-okat (`search_nodes`, `find_nodes`)
+3. Járd be az 1–2 hop szomszédokat (`neighbors`)
+4. Szűrj kapcsolattípus szerint
+5. Építs lokális subgraphot
+6. Csak ebből válaszolj
+
+A chunk nem elsődleges tudáselem — csak bizonyíték. Elsődleges: **node, edge, status, provenance**.
+
+### Háromrétegű státusz-kényszer
+
+Minden állítás előtt kötelező meghatározni:
+
+- `implemented` — van kód, van runtime belépési pont
+- `scaffold` — van kód, de nincs éles runtime híd
+- `concept` — csak dokumentáció vagy graph node, kód nincs
+
+Ha node- vagy file-szinten nem tudod alátámasztani, **nem mondhatod ki tényként**.
+
+### Kötelező ellenőrző lánc
+
+Minden fontos állításhoz belső validáció:
+
+```
+fogalom → definíciós doc → companion/meta → graph kapcsolat → kód/scaffold hely → runtime belépési pont
+```
+
+Ha a lánc megszakad:
+> "a modell itt létezik, de az implementációs lánc itt megszakad: [hely]"
+
+Nem azt mondod, hogy "nincs" — hanem megnevezed, hol törik el.
+
+### Bridge detector
+
+Minden válasz előtt ellenőrizd a hidakat:
+
+- `concept → code` bridge: van-e implementáció?
+- `code → runtime` bridge: van-e belépési pont?
+- `runtime → audit` bridge: van-e trace/log/proof?
+
+Ha hiányzik: státusz = scaffold vagy concept, nem implemented.
+
+### Immersion mód
+
+Ha a feladat fogalmi megértés (nem implementáció, nem audit):
+
+**Tilos:**
+- Javaslatot tenni
+- Kritikát mondani
+- Hiányt feltételezni
+
+**Csak:**
+- Axiómákat felvenni
+- Fogalmi szerkezetet és relációkat térképezni
+- Rendszerlogikát internalizálni
+
+### Válasz formátum (strukturált állításokhoz)
+
+| Mező | Tartalom |
+|------|----------|
+| **fogalom** | mi ez |
+| **mit jelent a rendszerben** | szerepe, funkciója |
+| **hol él** | node ID, fájlút |
+| **státusz** | implemented / scaffold / concept |
+| **mihez kapcsolódik** | szomszédos node-ok, edge-típusok |
+| **bizonyíték** | chunk ID vagy doc referencia |
+| **nyitott híd** | hol törik el az implementációs lánc |
+
+---
+
 ## Repo konvenciók
 
 - Branch naming: `{component}/releases/v{VERSION}` (release), `mcp/devel` (MCP fejlesztés)
