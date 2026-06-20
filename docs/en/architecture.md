@@ -1,68 +1,69 @@
 # System Architecture Overview
 
-This document provides a high-level overview of the project's architecture and operational philosophy. The goal is for a new developer to understand the system's fundamental concepts within 5-10 minutes.
+This document provides a high-level overview of the `cic-mcp-shared` component's architecture
+and its role within the `cic-mcp-*` family. The goal is for a new developer/agent to understand
+the component's fundamental concepts and boundaries within 5-10 minutes.
 
-## The "Template Factory" Concept
+The full, normative design source lives in the `cic-mcp-factory` repo:
+[`.cic-context/factory-docs/architecture.md`](https://github.com/CentralInfraCore/cic-mcp-factory/blob/main/.cic-context/factory-docs/architecture.md#cic-mcp-shared) —
+this document is the shared-specific excerpt of it.
 
-The most important thing to understand is that this repository (`base-repo`) does not contain a final product, but rather a **"Template Factory"**. Its responsibility is to produce and maintain templates from which actual "Production" repositories will later be created.
+## The "Shared layer" concept
 
-- **Template Repo (this repo):** The "source of truth" for CI/CD processes, release logic, build scripts, and common configurations.
-- **Production Repo:** A repository derived from the template, containing specific business logic (e.g., a Go application, a schema definition).
+In the trust-domain layering of the `cic-mcp-*` family, this component **merges multiple
+sessions**, identifies recurring concepts, weighting and promotion candidates — but it is
+never the first source of truth, and never canonical.
 
-## The Ecosystem of Repositories
+```text
+cic-mcp-knowledge   reviewed/canonical knowledge, versioned
+cic-mcp-workdir     current repo/worktree/branch/diff (role filled by cic-factory)
+cic-mcp-session     session-scope event, timeline, chunk, retrieval, provenance
+cic-mcp-shared      cross-session memory, weighting, conflict               ← THIS REPO
+cic-mcp-gateway     trust-domain aware context compiler
+cic-mcp-factory     the family's capability production/maintenance factory
+```
 
-The system is built from multiple interconnected repositories. Updates automatically propagate from the template repo to the production repos.
+## Boundaries
+
+**Yes:**
+- merging multiple sessions
+- factory job/PR/artifact linkage
+- identifying recurring concepts
+- weighting
+- conflict/superseded candidates
+- promotion candidates
+
+**No:**
+- being the first source of truth for raw hook ingestion
+- canonical layer
+
+## Trust model
+
+```yaml
+trust: mixed / candidate / reviewed_shared
+canonical: false   # by default
+```
+
+The shared layer never builds canonical fact automatically — knowledge promotion is a
+separate, human review flow (thead02), not this layer's job.
+
+## Planned data flow (not yet implemented)
 
 ```mermaid
 graph TD
-    A[Template Repo (base-repo)] -- "Renovate updates" --> B(Production Repo 1);
-    A -- "Renovate updates" --> C(Production Repo 2);
-    A -- "Renovate updates" --> D(Production Repo N);
+    A[cic-mcp-session catalog] --> B[shared: cross-session aggregation]
+    B --> C[shared: weighting / recurring concepts]
+    C --> D[shared: conflict / superseded candidates]
+    D --> E[shared: promotion_candidate]
+    E -- human review --> F[cic-mcp-knowledge - canonical]
 ```
 
-## The Engine of Automation: Renovate
+Consumes `cic-mcp-session` through the session API/MCP boundary, never direct table access.
+Capability job order: `shared-session-catalog-consumer-001` →
+`shared-cross-session-search-001` → `shared-weighting-model-001`.
 
-The heart of the system is **Renovate**. This tool monitors the `release` tags of the template repository, and when it detects a new version, it automatically opens Pull Requests (PRs) on the production repositories.
+## Current state
 
-This ensures that central logic (e.g., a security fix in the CI process) automatically and consistently reaches all products with minimal human intervention.
-
-## The Role of the Unified Compiler (`compiler.py`)
-
-The system uses a single, unified `compiler.py` script, whose role is dual depending on the execution environment. This tool simultaneously represents the "template management engine" and the "product manufacturing payload."
-
-1.  **Template Maintainer Role (executed in `base-repo`)**
-    - **Responsibility:** Maintaining and versioning the template repository.
-    - **Task:** Validating and "finalizing" the central `project.yaml` configuration file when a new version of the template is released. This process ensures the internal consistency of the template.
-
-2.  **Product Manufacturer Role (executed in the derived production repo)**
-    - **Responsibility:** The template's "payload." This is the tool that a production repo created from the template uses to produce its own final product (e.g., a digitally signed schema, a Go binary).
-    - **Task:** Creating a digitally signed, counter-signed "artifact" from a specific source file within the production repo's own release process.
-
-This unified approach ensures that production repositories always use exactly the same logic and tools to manufacture their own products as the template repo uses to maintain itself.
-
-## The Path of Changes and the Branching Model
-
-Changes follow a strictly defined path through the systems.
-
-```mermaid
-graph LR
-    subgraph "Template Repo (base-repo)"
-        T_MAIN[main] -- "release tag" --> T_REL(v1.2.0);
-        T_DF[df/feature] --> T_MAIN;
-        T_SCHEMAS[schemas/f/1] -- "specialization" --> T_MAIN;
-    end
-
-    subgraph "Production Repo"
-        P_MAIN[main];
-        P_DF[df/feature];
-        T_REL -- "Renovate PR" --> P_DF;
-        P_DF -- "merge" --> P_MAIN;
-    end
-
-    style T_REL fill:#f9f,stroke:#333,stroke-width:2px
-```
-
-1.  **Development in the Template Repo:** Development takes place on `df/xxx` branches, which originate from `main` or a specialization branch (e.g., `schemas/f/1`).
-2.  **Template Release:** A new `release` tag is created from changes merged into the `main` branch.
-3.  **Distribution:** Renovate detects the new tag and opens a PR on the `df/xxx` development branches of the production repositories.
-4.  **Integration into the Product:** Developers merge the update into their own work, then into the `main` branch, which triggers the product release.
+The repo was bootstrapped from the `base-repo` `mcp/main` MCP server scaffold (2026-06-20) —
+none of the above data flow is implemented yet, `source/` is empty. The Phase 4 capability
+jobs are now listed in `job-slices.yaml`, but have not run yet.

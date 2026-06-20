@@ -1,68 +1,70 @@
 # Rendszer Architektúra Áttekintés
 
-Ez a dokumentum a projekt magas szintű architektúráját és működési filozófiáját mutatja be. A cél, hogy egy új fejlesztő 5-10 perc alatt megértse a rendszer alapvető koncepcióit.
+Ez a dokumentum a `cic-mcp-shared` komponens magas szintű architektúráját és a `cic-mcp-*`
+családban betöltött szerepét mutatja be. A cél, hogy egy új fejlesztő/agent 5-10 perc alatt
+megértse a komponens alapvető koncepcióit és határait.
 
-## A "Sablon Gyár" Koncepció
+A teljes, normatív tervezési alap a `cic-mcp-factory` repóban él:
+[`.cic-context/factory-docs/architecture.md`](https://github.com/CentralInfraCore/cic-mcp-factory/blob/main/.cic-context/factory-docs/architecture.md#cic-mcp-shared) —
+ez a dokumentum annak a shared-specifikus kivonata.
 
-A legfontosabb megérteni, hogy ez a repository (`base-repo`) nem egy végterméket tartalmaz, hanem egy **"Sablon Gyár"** (Template Factory). A felelőssége, hogy olyan sablonokat gyártson és tartson karban, amelyekből később a tényleges "Termék Gyártó" (Production) repository-k jönnek létre.
+## A "Shared réteg" koncepció
 
-- **Sablon Repo (ez a repo):** A CI/CD folyamatok, a release logika, a build scriptek és a közös konfigurációk "forrása" (source of truth).
-- **Termelési Repo:** A sablonból származtatott, konkrét üzleti logikát (pl. egy Go alkalmazást, egy séma definíciót) tartalmazó repository.
+A `cic-mcp-*` család trust-domain rétegezésében ez a komponens **több session-t fűz össze**,
+visszatérő fogalmakat, súlyozást és promotion-kandidátusokat jelöl ki — de sosem ő az első
+igazságforrás, és sosem canonical.
 
-## A Repók Ökoszisztémája
+```text
+cic-mcp-knowledge   reviewed/canonical tudás, verziózott
+cic-mcp-workdir     aktuális repo/worktree/branch/diff (= cic-factory szerepe)
+cic-mcp-session     session-scope event, timeline, chunk, retrieval, provenance
+cic-mcp-shared      cross-session memória, súlyozás, konfliktus               ← EZ A REPO
+cic-mcp-gateway     trust-domain aware context compiler
+cic-mcp-factory     a család capability gyártó/karbantartó factory-ja
+```
 
-A rendszer több, egymással kapcsolatban álló repository-ból épül fel. A frissítések a sablon repóból automatikusan terjednek a termelési repók felé.
+## Fő határok
+
+**Igen:**
+- több session összefűzése
+- factory job/PR/artifact kapcsolás
+- visszatérő fogalmak azonosítása
+- súlyozás
+- konfliktus/superseded jelöltek
+- promotion candidates
+
+**Nem:**
+- raw hook ingestion első igazságforrása
+- canonical layer
+
+## Trust modell
+
+```yaml
+trust: mixed / candidate / reviewed_shared
+canonical: false   # by default
+```
+
+A shared réteg nem épít canonical tényt automatikusan — a knowledge promotion külön, emberi
+review-flow (thead02), nem ennek a rétegnek a feladata.
+
+## Tervezett adatfolyam (még nem implementált)
 
 ```mermaid
 graph TD
-    A[Template Repo (base-repo)] -- "Renovate frissíti" --> B(Production Repo 1);
-    A -- "Renovate frissíti" --> C(Production Repo 2);
-    A -- "Renovate frissíti" --> D(Production Repo N);
+    A[cic-mcp-session catalog] --> B[shared: cross-session aggregation]
+    B --> C[shared: weighting / recurring concepts]
+    C --> D[shared: conflict / superseded candidates]
+    D --> E[shared: promotion_candidate]
+    E -- human review --> F[cic-mcp-knowledge — canonical]
 ```
 
-## Az Automatizáció Motorja: Renovate
+A `cic-mcp-session`-t a session API/MCP határon keresztül fogyasztja, közvetlen tábla-hozzáférés
+nélkül. A capability-jobok sorrendje: `shared-session-catalog-consumer-001` →
+`shared-cross-session-search-001` → `shared-weighting-model-001`.
 
-A rendszer lelke a **Renovate**. Ez az eszköz figyeli a sablon repository `release` tag-jeit, és amikor új verziót észlel, automatikusan Pull Requesteket (PR) nyit a termelési repókon.
+## Jelenlegi állapot
 
-Ez biztosítja, hogy a központi logika (pl. egy biztonsági javítás a CI folyamatban) automatikusan és konzisztensen eljusson minden termékhez, minimális emberi beavatkozással.
-
-## Az Egységes Compiler (`compiler.py`) Szerepe
-
-A rendszer egyetlen, egységes `compiler.py` scriptet használ, amelynek a szerepe a futási környezettől függően kettős. Ez az eszköz egyszerre képviseli a "sablont kezelő motort" és a "terméket gyártó hasznos terhet".
-
-1.  **Sablon Karbantartó Szerepkör (a `base-repo`-ban futtatva)**
-    - **Felelősség:** A sablon repository karbantartása és verziózása.
-    - **Feladat:** A `project.yaml` központi konfigurációs fájl validálása és "lezárása" (finalizing) a sablon egy új verziójának kiadásakor. Ez a folyamat biztosítja a sablon belső konzisztenciáját.
-
-2.  **Termék Gyártó Szerepkör (a származtatott termelési repóban futtatva)**
-    - **Felelősség:** A sablon "hasznos terhe" (`payload`). Ez az az eszköz, amit a sablonból létrehozott termelési repo a saját végtermékének (pl. aláírt séma, Go bináris) előállítására használ.
-    - **Feladat:** Egy konkrét forrásfájlból egy digitálisan aláírt, ellenjegyzett "műtárgy" (artifact) létrehozása a termelési repo saját release folyamatában.
-
-Ez az egységes megközelítés biztosítja, hogy a termelési repók mindig pontosan ugyanazt a logikát és eszközt használják a saját termékük gyártására, mint amit a sablon repo használ a saját maga karbantartására.
-
-## A Változások Útja és a Branching Modell
-
-A változások egy szigorúan definiált útvonalon haladnak a rendszereken keresztül.
-
-```mermaid
-graph LR
-    subgraph "Template Repo (base-repo)"
-        T_MAIN[main] -- "release tag" --> T_REL(v1.2.0);
-        T_DF[df/feature] --> T_MAIN;
-        T_SCHEMAS[schemas/f/1] -- "specializáció" --> T_MAIN;
-    end
-
-    subgraph "Production Repo"
-        P_MAIN[main];
-        P_DF[df/feature];
-        T_REL -- "Renovate PR" --> P_DF;
-        P_DF -- "merge" --> P_MAIN;
-    end
-
-    style T_REL fill:#f9f,stroke:#333,stroke-width:2px
-```
-
-1.  **Fejlesztés a Sablon Repóban:** A fejlesztés `df/xxx` ágakon történik, amelyek a `main` vagy egy specializációs ágból (pl. `schemas/f/1`) indulnak.
-2.  **Sablon Release:** A `main` ágra merge-elt változásokból egy új `release` tag jön létre.
-3.  **Terjesztés:** A Renovate észleli az új taget, és PR-t nyit a termelési repók `df/xxx` fejlesztési ágaira.
-4.  **Integráció a Termékbe:** A fejlesztők beolvasztják a frissítést a saját munkájukba, majd a `main` ágra, ami a termék kiadását triggereli.
+A repo a `base-repo` `mcp/main` MCP-szerver scaffold-jából lett bootstrapelve
+(2026-06-20) — a fenti adatfolyamból jelenleg semmi nincs implementálva, a `source/` mappa
+üres. A Phase 4 capability-jobok jelenleg vannak felvéve a `job-slices.yaml`-ba, de még
+nem futottak.
