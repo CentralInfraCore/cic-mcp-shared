@@ -79,6 +79,23 @@ PROMOTION_WEIGHT_THRESHOLD = 0.5
 PROMOTION_MIN_RECURRENCE = 2
 
 
+def decide_trust_level(weight_score: float, recurrence_count: int) -> str:
+    """Determine the trust level for a new shared_core.candidates row.
+
+    Applies the promotion-candidate gating contract from shared-weighting-
+    model-001 (lines 290-298): both conditions must hold simultaneously
+    (AND, not OR) for a row to be promoted to 'candidate'. If either
+    condition fails, the row is inserted as 'mixed' -- the lowest trust
+    level allowed for an automatically generated row by the schema CHECK
+    constraint ('mixed', 'candidate', 'reviewed_shared'). 'reviewed_shared'
+    and 'canonical' are never set here -- they are always the result of a
+    separate human review flow.
+    """
+    if recurrence_count >= PROMOTION_MIN_RECURRENCE and weight_score >= PROMOTION_WEIGHT_THRESHOLD:
+        return "candidate"
+    return "mixed"
+
+
 @dataclass(frozen=True)
 class SharedStoreConfig:
     """DB connection parameters for shared_core.candidates writes, sourced
@@ -371,14 +388,15 @@ def _insert_candidate(
 ) -> str:
     """INSERT one shared_core.candidates row using the EXISTING schema
     (shared-core-storage-implementation-001/output/shared-core-storage-
-    schema.sql) -- no schema changes, no new columns. `trust` is set to
-    'candidate' (not 'mixed'/'reviewed_shared') because this row is the
-    direct output of an automated cross-session aggregation, matching the
-    schema's own trust model (cic-mcp-shared/CLAUDE.md "Trust modell":
-    promotion to reviewed_shared/canonical is a separate human review flow,
-    never this layer's job). `canonical` is left at its DEFAULT FALSE (not
-    set explicitly) -- the canonical_requires_reviewed_shared CHECK
-    constraint would reject canonical=true at trust='candidate' anyway.
+    schema.sql) -- no schema changes, no new columns. `trust` is determined
+    by decide_trust_level(weight_score, recurrence_count): 'candidate' if
+    both recurrence_count >= PROMOTION_MIN_RECURRENCE and weight_score >=
+    PROMOTION_WEIGHT_THRESHOLD, 'mixed' otherwise. 'reviewed_shared' and
+    'canonical' are never set here -- they are always the result of a
+    separate human review flow (cic-mcp-shared/CLAUDE.md "Trust modell").
+    `canonical` is left at its DEFAULT FALSE (not set explicitly) -- the
+    canonical_requires_reviewed_shared CHECK constraint would reject
+    canonical=true at trust='candidate' anyway.
     """
     with psycopg.connect(config.conninfo()) as conn:
         with conn.cursor() as cur:
@@ -398,7 +416,7 @@ def _insert_candidate(
                 """,
                 (
                     keyword_description,
-                    "candidate",
+                    decide_trust_level(weight_score, recurrence_count),
                     weight_score,
                     recurrence_count,
                     linked_factory_job_ids,
