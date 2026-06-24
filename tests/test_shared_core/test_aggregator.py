@@ -58,7 +58,13 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from shared_core.aggregator import SharedStoreConfig, aggregate_cross_session
+from shared_core.aggregator import (
+    SharedStoreConfig,
+    aggregate_cross_session,
+    decide_trust_level,
+    PROMOTION_WEIGHT_THRESHOLD,
+    PROMOTION_MIN_RECURRENCE,
+)
 
 SHARED_REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -307,3 +313,30 @@ def test_aggregate_cross_session_no_factory_link_no_recency(
     assert result.recency_bonus == 0.0
     assert result.weight_score == pytest.approx(result.cross_session_score)
     assert result.recurrence_count >= 2
+
+
+def test_trust_gating_both_branches():
+    """Unit test for decide_trust_level() -- both branches, no Postgres needed.
+
+    Proves that:
+    1. Both conditions met -> 'candidate'
+    2. recurrence_count below threshold -> 'mixed'
+    3. weight_score below threshold -> 'mixed'
+    4. Both below threshold -> 'mixed'
+    """
+    # Branch 1: both conditions met -> candidate
+    assert decide_trust_level(PROMOTION_WEIGHT_THRESHOLD, PROMOTION_MIN_RECURRENCE) == "candidate"
+    assert decide_trust_level(1.0, 5) == "candidate"
+    assert decide_trust_level(PROMOTION_WEIGHT_THRESHOLD + 0.01, PROMOTION_MIN_RECURRENCE) == "candidate"
+
+    # Branch 2: recurrence_count < PROMOTION_MIN_RECURRENCE -> mixed
+    assert decide_trust_level(1.0, PROMOTION_MIN_RECURRENCE - 1) == "mixed"
+    assert decide_trust_level(1.0, 1) == "mixed"
+    assert decide_trust_level(1.0, 0) == "mixed"
+
+    # Branch 3: weight_score < PROMOTION_WEIGHT_THRESHOLD -> mixed
+    assert decide_trust_level(PROMOTION_WEIGHT_THRESHOLD - 0.01, PROMOTION_MIN_RECURRENCE) == "mixed"
+    assert decide_trust_level(0.0, PROMOTION_MIN_RECURRENCE) == "mixed"
+
+    # Branch 4: both below threshold -> mixed
+    assert decide_trust_level(0.0, 0) == "mixed"
