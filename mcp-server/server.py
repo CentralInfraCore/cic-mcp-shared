@@ -1167,6 +1167,32 @@ def guided_path(topic: str, max_steps: int = 10) -> dict:
 SOURCE_DIR = Path(os.environ.get("SOURCE_DIR", str(BASE_DIR / "source")))
 
 
+def _resolve_within_source_dir(file_path: str) -> Path:
+    """Build an absolute path from a client-supplied file_path and verify it stays
+    inside SOURCE_DIR.
+
+    Mirrors the existing path-construction convention (absolute stays absolute,
+    relative is joined to SOURCE_DIR), then resolves both the candidate and
+    SOURCE_DIR to their canonical, symlink-free form and checks containment with
+    Path.is_relative_to() — NOT a string-prefix comparison, which is bypassable
+    via symlinks or '..' segments.
+
+    Raises:
+        ValueError: if the resolved path escapes SOURCE_DIR.
+    """
+    p = Path(file_path)
+    if not p.is_absolute():
+        p = SOURCE_DIR / file_path
+
+    resolved = p.resolve()
+    resolved_source_dir = SOURCE_DIR.resolve()
+
+    if not resolved.is_relative_to(resolved_source_dir):
+        raise ValueError(f"path escapes SOURCE_DIR: {file_path!r} resolved to {resolved}")
+
+    return resolved
+
+
 _COMPANION_LANGS = {
     "go": {"glob": "*.go", "is_test": lambda name: "_test.go" in name},
     "py": {"glob": "*.py", "is_test": lambda name: name.startswith("test_") or name.endswith("_test.py")},
@@ -1509,9 +1535,11 @@ def update_companion(
     """
     import yaml as _yaml
 
-    p = Path(file_path)
-    if not p.is_absolute():
-        p = SOURCE_DIR / file_path
+    try:
+        p = _resolve_within_source_dir(file_path)
+    except ValueError:
+        return {"success": False, "path": file_path, "message": "path escapes SOURCE_DIR, refused"}
+
     if not p.exists():
         return {"success": False, "path": str(p), "message": "file not found"}
 
@@ -1584,9 +1612,10 @@ def record_decision(
     # Resolve companion path from node if not given
     p: Optional[Path] = None
     if companion_path:
-        p = Path(companion_path)
-        if not p.is_absolute():
-            p = SOURCE_DIR / companion_path
+        try:
+            p = _resolve_within_source_dir(companion_path)
+        except ValueError:
+            return {"success": False, "path": companion_path, "message": "path escapes SOURCE_DIR, refused"}
     else:
         node = kb["nodes"].get(str(node_id))
         if node:
@@ -1607,6 +1636,15 @@ def record_decision(
             "node_id": node_id,
             "message": "companion file not found — provide companion_path explicitly",
         }
+
+    # Final confinement check covers BOTH resolution paths above: the explicit
+    # companion_path branch (already checked) and the node_id-derived branch,
+    # which can also escape SOURCE_DIR if the node's source_file/file_path is
+    # itself an absolute, out-of-tree path.
+    try:
+        p = _resolve_within_source_dir(str(p))
+    except ValueError:
+        return {"success": False, "path": str(p), "message": "path escapes SOURCE_DIR, refused"}
 
     try:
         with p.open() as f:
