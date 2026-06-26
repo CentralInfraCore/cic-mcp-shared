@@ -25,8 +25,17 @@ A komponensek közti pontos határt lásd: [CLAUDE.md](CLAUDE.md).
 ## Státusz
 
 `experimental` — a repo a `cic-mcp-factory` job-lifecycle-én keresztül épül fel, kapacitás-jobonként.
-Jelenleg a `base-repo` `mcp/main` template-jéből bootstrapelt MCP-szerver scaffold van benne,
-saját shared-specifikus implementáció (cross-session aggregáció, súlyozási modell) még nincs.
+
+**Implementált (`implemented`):**
+- `shared_core/aggregator.py` — `aggregate_cross_session()`: cross-session aggregáció,
+  trust level scoring, evidence gate, score cap, `CrossSessionAggregationResult`
+- `shared_core/session_client.py` — session catalog consumer
+
+**Scaffold (kód van, de nincs bekötve):**
+- domain-specifikus MCP tool-ok — nincs `shared_server.py`; a `mcp-server/server.py` a
+  base-repo FastMCP KB szerver, nem shared-specifikus
+- schema migration runner — a DB séma (`output/shared-core-storage-schema.sql`) létezik,
+  de nincs automatizált migráció-futtató
 
 ## Kapcsolódó dokumentáció
 
