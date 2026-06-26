@@ -36,11 +36,18 @@ emberi review-flow, nem ennek a rétegnek a feladata.
 
 ## Jelenlegi állapot
 
-`experimental`, nincs még shared-specifikus implementáció — a `make_source.py`/`mcp-server/`
-scaffold a `base-repo` MCP-template öröksége, `source/` üres. Az első capability-jobok
-(`shared-session-catalog-consumer-001`, `shared-cross-session-search-001`,
-`shared-weighting-model-001` — `execution-phases.md` Phase 4) jelenleg még nincsenek
-lebontva a `cic-mcp-factory/jobs/.../factory-docs/job-slices.yaml`-ban, ezt elsőként pótolni kell.
+`experimental` — shared-specifikus implementáció létezik, az alábbi státuszokkal:
+
+| Komponens | Státusz | Megjegyzés |
+|---|---|---|
+| `shared_core/aggregator.py` | **implemented** | cross-session aggregáció, scoring, evidence gate |
+| `shared_core/session_client.py` | **implemented** | session catalog consumer |
+| domain-specifikus MCP tool-ok | **scaffold** | nincs `shared_server.py` — a `mcp-server/server.py` base-repo KB szerver |
+| schema migration runner | **scaffold** | `output/shared-core-storage-schema.sql` létezik, automatizált futtató nincs |
+
+A `source/` üres — a base-repo FastMCP KB szerver shared kontextusban nem aktív. Az
+aggregátor közvetlenül hívja a `cic-mcp-session` MCP szervert subprocess-en keresztül
+(`shared_core/session_client.py`).
 
 ## MCP szerver
 
