@@ -42,8 +42,10 @@ emberi review-flow, nem ennek a rétegnek a feladata.
 |---|---|---|
 | `shared_core/aggregator.py` | **implemented** | cross-session aggregáció, scoring, evidence gate |
 | `shared_core/session_client.py` | **implemented** | session catalog consumer |
+| `shared_core/review_lifecycle.py` | **implemented** | `promote_to_reviewed_shared()`, `promote_to_canonical()`, `reject_candidate()`, `mark_superseded()` |
+| `migrations/` | **implemented** | `0001_candidate_transitions_audit.sql` — séma migration SQL |
+| migration runner CLI | **scaffold** | SQL kézzel alkalmazandó, nincs automatizált futtatószript |
 | domain-specifikus MCP tool-ok | **scaffold** | nincs `shared_server.py` — a `mcp-server/server.py` base-repo KB szerver |
-| schema migration runner | **scaffold** | `output/shared-core-storage-schema.sql` létezik, automatizált futtató nincs |
 
 A `source/` üres — a base-repo FastMCP KB szerver shared kontextusban nem aktív. Az
 aggregátor közvetlenül hívja a `cic-mcp-session` MCP szervert subprocess-en keresztül
